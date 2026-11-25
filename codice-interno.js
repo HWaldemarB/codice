@@ -227,6 +227,7 @@
         tx.objectStore(STORE).delete(path);
         await txDone(tx);
       }
+      try { window.dispatchEvent(new CustomEvent('codice-interno-remove', { detail: { path } })); } catch (e) {}
     }
     async resolve(child) {
       if (!child || !child._path) return null;
@@ -417,8 +418,18 @@
     });
   }
 
+  /** Lista todo lo guardado (para el respaldo automático). */
+  async function listAll() {
+    const all = await allEntries();
+    return all.map(e => ({ path: e.path, kind: e.kind, mtime: e.mtime || 0, size: (e.data && e.data.size) || 0 }));
+  }
+  async function readBlob(path) {
+    const rec = await getEntry(path);
+    return rec && rec.kind === 'file' ? rec.data : null;
+  }
+
   window.CodiceInterno = {
-    root, stats, exportZip, importZip, importLooseFiles, requestPersistence,
+    root, stats, listAll, readBlob, exportZip, importZip, importLooseFiles, requestPersistence,
     isInterno: h => !!(h && h.__codiceInterno),
     ROOT_NAME
   };
