@@ -9452,11 +9452,7 @@
     let micelioRevealCount = 0;  // cuántos nodos ya nacieron
     // Intervalo entre nodos (ms). Más alto = más lento, tipo Obsidian.
     const MICELIO_NODE_INTERVAL_BASE_MS = 90;
-    const MICELIO_REVEAL_MAX_MS = 1800; // v1.59: el nacimiento completo dura como mucho ~2 s
-    function micelioNodeInterval() {
-      const total = (typeof micelioRevealOrder !== 'undefined' && micelioRevealOrder.length) || grafoNodes.length || 1;
-      return Math.max(3, Math.min(MICELIO_NODE_INTERVAL_BASE_MS, MICELIO_REVEAL_MAX_MS / total));
-    }
+    function micelioNodeInterval() { return MICELIO_NODE_INTERVAL_BASE_MS; } // ritmo de crecimiento elegido por el autor
     const MICELIO_NODE_FADE_MS = 360;
 
     function asignarEtapasRevealMicelio(mode) {
