@@ -1,6 +1,6 @@
 /* Códice — service worker: guarda la app en el teléfono para usarla sin señal.
    Las notas NO pasan por acá: viven en el almacenamiento interno (IndexedDB). */
-const VERSION = 'codice-v1.59-1';
+const VERSION = 'codice-v1.59-2';
 const ASSETS = [
   './',
   './index.html',

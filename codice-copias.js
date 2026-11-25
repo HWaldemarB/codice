@@ -203,3 +203,121 @@ function initCopiasUI() {
 }
 
 document.addEventListener('DOMContentLoaded', () => { try { initCopiasUI(); } catch (e) { console.warn(e); } });
+
+// ===== v1.59: pasar una carpeta a la app (una sola vez) y guardar en carpeta =====
+
+/** Copia recursiva entre dos carpetas (reales o internas). */
+async function codiceCopiarArbol(src, dst, onProgress, state) {
+  state = state || { n: 0 };
+  for await (const entry of src.values()) {
+    if (entry.kind === 'directory') {
+      if (/^(\.obsidian|\.trash|\.git)$/.test(entry.name)) continue;
+      const d = await dst.getDirectoryHandle(entry.name, { create: true });
+      await codiceCopiarArbol(entry, d, onProgress, state);
+    } else {
+      if (entry.name.startsWith('.')) continue;
+      try {
+        const f = await entry.getFile();
+        const fh = await dst.getFileHandle(entry.name, { create: true });
+        const w = await fh.createWritable();
+        await w.write(f);
+        await w.close();
+        state.n++;
+        if (onProgress && state.n % 10 === 0) onProgress(state.n);
+      } catch (e) { console.warn('No se pudo copiar', entry.name, e); }
+    }
+  }
+  return state.n;
+}
+
+async function pasarCarpetaALaApp(srcHandle) {
+  const root = await CodiceInterno.root();
+  statusEl.textContent = 'Pasando el Códice a la app…';
+  const n = await codiceCopiarArbol(srcHandle, root, (k) => { statusEl.textContent = 'Pasando a la app… ' + k + ' archivos'; });
+  await _activateVaultOriginal(root, { offerStructure: false });
+  await saveVaultHandle(root);
+  try { localStorage.setItem('codice-modo', 'interno'); } catch (e) {}
+  refreshEmptyStateForMode();
+  codiceToast('✔ Listo: ' + n + ' archivos pasaron a la app. Desde ahora el Códice abre solo, sin pedir carpeta.', 7000);
+  return n;
+}
+
+async function guardarEnCarpeta() {
+  const msg = document.getElementById('copias-msg');
+  if (!window.showDirectoryPicker) { msg.textContent = 'Este navegador no permite elegir carpetas. Usá «Descargar copia».'; return; }
+  if (!directoryHandle) { msg.textContent = 'Primero abrí un Códice.'; return; }
+  let dst;
+  try { dst = await window.showDirectoryPicker({ mode: 'readwrite' }); } catch (e) { return; }
+  try {
+    if (typeof silentAutosaveCurrent === 'function') { try { await silentAutosaveCurrent(); } catch (e) {} }
+    msg.textContent = 'Guardando en «' + dst.name + '»…';
+    const n = await codiceCopiarArbol(directoryHandle, dst, (k) => { msg.textContent = 'Guardando… ' + k + ' archivos'; });
+    try { localStorage.setItem('codice-ultima-copia', String(Date.now())); } catch (e) {}
+    msg.textContent = '✔ ' + n + ' archivos guardados en «' + dst.name + '».';
+  } catch (e) {
+    console.error(e);
+    msg.textContent = '✖ No se pudo guardar: ' + (e.message || e);
+  }
+}
+
+async function elegirCarpetaYPasar() {
+  const msg = document.getElementById('copias-msg');
+  if (!window.showDirectoryPicker) { msg.textContent = 'Este navegador no permite elegir carpetas. Usá «Restaurar / importar copia (.zip)».'; return; }
+  let src;
+  try { src = await window.showDirectoryPicker({ mode: 'read' }); } catch (e) { return; }
+  msg.textContent = 'Pasando «' + src.name + '» a la app…';
+  try {
+    const n = await pasarCarpetaALaApp(src);
+    msg.textContent = '✔ ' + n + ' archivos pasaron a la app.';
+    openCopiasModal(true);
+  } catch (e) {
+    console.error(e);
+    msg.textContent = '✖ No se pudo pasar: ' + (e.message || e);
+  }
+}
+
+// Envolver activateVaultFromHandle: al abrir una carpeta real, ofrecer pasarla a la app (una vez)
+const _activateVaultOriginal = activateVaultFromHandle;
+activateVaultFromHandle = async function (handle, opts) {
+  opts = opts || {};
+  const esReal = handle && !CodiceInterno.isInterno(handle);
+  // No volver a preguntar por la estructura si la carpeta ya la tiene (0 a 7)
+  if (esReal && opts.offerStructure !== false) {
+    try {
+      const names = [];
+      for await (const e of handle.values()) if (e.kind === 'directory') names.push(e.name);
+      const nums = new Set(names.map(n => (n.match(/^\s*([0-7])\b/) || [])[1]).filter(Boolean));
+      if (nums.size >= 8) opts = Object.assign({}, opts, { offerStructure: false });
+    } catch (e) {}
+  }
+  const r = await _activateVaultOriginal(handle, opts);
+  if (esReal) {
+    let no = null;
+    try { no = localStorage.getItem('codice-no-ofrecer-interno'); } catch (e) {}
+    if (!no) {
+      setTimeout(async () => {
+        const ok = confirm(
+          '¿Pasar el Códice a la app?\n\n' +
+          'Se copian tus ' + notes.size + ' notas y fotos adentro de la app. Desde ahí:\n' +
+          '• abre solo, sin elegir carpeta ni dar permisos\n' +
+          '• funciona sin señal y va más rápido\n\n' +
+          'Tu carpeta «' + handle.name + '» queda como está. Cuando quieras, con 💾 → «Guardar todo en una carpeta» actualizás la carpeta (o la tarjeta SD).'
+        );
+        if (ok) {
+          try { await pasarCarpetaALaApp(handle); } catch (e) { console.error(e); alert('No se pudo pasar a la app: ' + (e.message || e)); }
+        } else {
+          try { localStorage.setItem('codice-no-ofrecer-interno', '1'); } catch (e) {}
+        }
+      }, 300);
+    }
+  }
+  return r;
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+  on('btn-pasar-carpeta', elegirCarpetaYPasar);
+  on('btn-guardar-carpeta', guardarEnCarpeta);
+  const hasPicker = !!window.showDirectoryPicker;
+  ['btn-pasar-carpeta', 'btn-guardar-carpeta'].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = hasPicker ? '' : 'none'; });
+});

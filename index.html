@@ -2483,6 +2483,8 @@
         <button type="button" class="btn-secondary" id="btn-copia-share">↗ Enviar copia (Drive, WhatsApp, correo…)</button>
         <button type="button" class="btn-secondary" id="btn-copia-restore">⟲ Restaurar / importar copia (.zip)</button>
         <button type="button" class="btn-secondary" id="btn-copia-sueltos">＋ Importar notas sueltas (.md) o fotos</button>
+        <button type="button" class="btn-secondary" id="btn-pasar-carpeta">📂 → 📱 Pasar una carpeta a la app</button>
+        <button type="button" class="btn-secondary" id="btn-guardar-carpeta">📱 → 📂 Guardar todo en una carpeta (ej. tarjeta SD)</button>
         <button type="button" class="btn-secondary" id="btn-usar-interno">📱 Usar el Códice guardado en este dispositivo</button>
       </div>
       <p id="copias-msg" aria-live="polite"></p>
@@ -8183,13 +8185,51 @@
     }
 
     /** Unifica comillas tipográficas / ASCII para matching de nombres botánicos etc. */
+    // v1.59: memo — se llamaba miles de veces por cada enlace al armar el Micelio
+    const _normKeyCache = new Map();
     function normalizeNoteKey(s) {
-      return String(s || '')
+      const k = String(s || '');
+      let v = _normKeyCache.get(k);
+      if (v !== undefined) return v;
+      v = k
         .trim()
         .toLowerCase()
         .replace(/[\u2018\u2019\u201A\u2032`]/g, "'")
         .replace(/[\u201C\u201D\u2033]/g, '"')
         .replace(/\s+/g, ' ');
+      if (_normKeyCache.size > 50000) _normKeyCache.clear();
+      _normKeyCache.set(k, v);
+      return v;
+    }
+
+    /**
+     * v1.59: índice de enlaces (nombre/alias/ruta → ids) para no recorrer todas las notas
+     * por cada [[enlace]]. Vive solo durante la tarea actual (se descarta en el próximo tick),
+     * así nunca queda desactualizado al crear/renombrar/mover notas.
+     */
+    let _linkIdx = null;
+    function getLinkIndex() {
+      if (_linkIdx) return _linkIdx;
+      const byName = new Map(); // nombre/alias sin comillas → [ids] (orden de notes)
+      const byId = new Map();   // normalizeNoteKey(id) → primer id
+      const byFull = new Map(); // normalizeNoteKey(folder/short) → primer id
+      for (const [id, note] of notes) {
+        const nid = normalizeNoteKey(id);
+        if (!byId.has(nid)) byId.set(nid, id);
+        const full = normalizeNoteKey((note.folderPath ? note.folderPath + '/' : '') + note.shortName);
+        if (!byFull.has(full)) byFull.set(full, id);
+        const keys = new Set();
+        keys.add(normalizeNoteKey(note.shortName).replace(/['"]/g, ''));
+        if (note.aliases) note.aliases.forEach(a => keys.add(normalizeNoteKey(a).replace(/['"]/g, '')));
+        keys.forEach(k => {
+          let arr = byName.get(k);
+          if (!arr) { arr = []; byName.set(k, arr); }
+          arr.push(id);
+        });
+      }
+      _linkIdx = { byName, byId, byFull };
+      setTimeout(() => { _linkIdx = null; }, 0);
+      return _linkIdx;
     }
 
     function findNoteByShortName(shortName) {
@@ -8606,37 +8646,22 @@
       const leafNorm = normalizeNoteKey(leaf);
       const leafNoQuotes = leafNorm.replace(/['"]/g, '');
 
+      const LI = getLinkIndex();
       // 1) Ruta completa exacta (uniqueId)
       if (pathRaw.includes('/')) {
-        for (const [id, note] of notes) {
-          if (normalizeNoteKey(id) === pathNorm) {
-            return { status: 'resolved', ids: [id], heading: parsed.heading, label: note.shortName };
-          }
+        const hitId = LI.byId.get(pathNorm);
+        if (hitId !== undefined && notes.has(hitId)) {
+          return { status: 'resolved', ids: [hitId], heading: parsed.heading, label: notes.get(hitId).shortName };
         }
         // folderPath + shortName
-        for (const [id, note] of notes) {
-          const full = (note.folderPath ? note.folderPath + '/' : '') + note.shortName;
-          if (normalizeNoteKey(full) === pathNorm) {
-            return { status: 'resolved', ids: [id], heading: parsed.heading, label: note.shortName };
-          }
+        const hitFull = LI.byFull.get(pathNorm);
+        if (hitFull !== undefined && notes.has(hitFull)) {
+          return { status: 'resolved', ids: [hitFull], heading: parsed.heading, label: notes.get(hitFull).shortName };
         }
       }
 
       // 2) Nombre corto / alias → puede haber varios
-      const matches = [];
-      for (const [id, note] of notes) {
-        const sn = normalizeNoteKey(note.shortName);
-        if (sn === leafNorm || sn.replace(/['"]/g, '') === leafNoQuotes) {
-          matches.push(id);
-          continue;
-        }
-        if (note.aliases && note.aliases.some(a => {
-          const an = normalizeNoteKey(a);
-          return an === leafNorm || an.replace(/['"]/g, '') === leafNoQuotes;
-        })) {
-          matches.push(id);
-        }
-      }
+      const matches = (LI.byName.get(leafNoQuotes) || []).filter(id => notes.has(id));
       // Si el path tenía carpetas y no matcheó exacto, filtrar por sufijo de carpeta
       if (pathRaw.includes('/') && matches.length > 1) {
         const folderHint = normalizeNoteKey(pathRaw.split('/').slice(0, -1).join('/'));
@@ -9426,7 +9451,12 @@
     let micelioRevealOrder = []; // ids en orden de aparición
     let micelioRevealCount = 0;  // cuántos nodos ya nacieron
     // Intervalo entre nodos (ms). Más alto = más lento, tipo Obsidian.
-    const MICELIO_NODE_INTERVAL_MS = 90;
+    const MICELIO_NODE_INTERVAL_BASE_MS = 90;
+    const MICELIO_REVEAL_MAX_MS = 1800; // v1.59: el nacimiento completo dura como mucho ~2 s
+    function micelioNodeInterval() {
+      const total = (typeof micelioRevealOrder !== 'undefined' && micelioRevealOrder.length) || grafoNodes.length || 1;
+      return Math.max(3, Math.min(MICELIO_NODE_INTERVAL_BASE_MS, MICELIO_REVEAL_MAX_MS / total));
+    }
     const MICELIO_NODE_FADE_MS = 360;
 
     function asignarEtapasRevealMicelio(mode) {
@@ -9601,7 +9631,7 @@
     function micelioNodeAppearAlpha(n) {
       if (n.revealIndex == null) return 1;
       if (n.revealIndex >= micelioRevealCount) return 0;
-      const bornAt = micelioRevealT0 + n.revealIndex * MICELIO_NODE_INTERVAL_MS;
+      const bornAt = micelioRevealT0 + n.revealIndex * micelioNodeInterval();
       const age = performance.now() - bornAt;
       if (age <= 0) return 0;
       if (age >= MICELIO_NODE_FADE_MS) return 1;
@@ -9612,7 +9642,7 @@
     function micelioEdgeAppearAlpha(e) {
       if (e.revealIndex == null) return 1;
       if (e.revealIndex >= micelioRevealCount) return 0;
-      const bornAt = micelioRevealT0 + e.revealIndex * MICELIO_NODE_INTERVAL_MS;
+      const bornAt = micelioRevealT0 + e.revealIndex * micelioNodeInterval();
       const age = performance.now() - bornAt;
       if (age <= 0) return 0;
       if (age >= MICELIO_NODE_FADE_MS * 1.15) return 1;
@@ -9623,13 +9653,13 @@
     function micelioRevealDone() {
       const total = micelioRevealOrder.length || grafoNodes.length;
       return micelioRevealCount >= total &&
-        (performance.now() - micelioRevealT0) > (total * MICELIO_NODE_INTERVAL_MS + MICELIO_NODE_FADE_MS + 250);
+        (performance.now() - micelioRevealT0) > (total * micelioNodeInterval() + MICELIO_NODE_FADE_MS + 250);
     }
 
     function avanzarRevealSecuencial() {
       const elapsed = performance.now() - micelioRevealT0;
       const total = micelioRevealOrder.length || grafoNodes.length;
-      const shouldHave = Math.min(total, Math.floor(elapsed / MICELIO_NODE_INTERVAL_MS) + 1);
+      const shouldHave = Math.min(total, Math.floor(elapsed / micelioNodeInterval()) + 1);
       if (micelioRevealCount < shouldHave) micelioRevealCount = shouldHave;
       for (const n of grafoNodes) {
         n.appearAlpha = micelioNodeAppearAlpha(n);
@@ -9726,7 +9756,10 @@
         if (energyWindow.length > 18) energyWindow.shift();
         const avgE = energyWindow.reduce((a, b) => a + b, 0) / energyWindow.length;
         const minFrames = revealDone ? 180 : 400;
-        if (frames > minFrames && avgE < 0.018 && revealDone) {
+        // v1.59: además del umbral de energía, cortar la simulación a los ~6 s (ahorra batería con muchas notas)
+        if (revealDone && !tick._doneAt) tick._doneAt = performance.now();
+        const simTooLong = revealDone && tick._doneAt && (performance.now() - tick._doneAt) > 6000;
+        if (revealDone && ((frames > minFrames && avgE < 0.018) || simTooLong)) {
           grafoSettled = true;
           grafoAnim = null;
           grafoFit();
